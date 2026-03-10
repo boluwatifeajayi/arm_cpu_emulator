@@ -1,0 +1,7 @@
+// Instruction encodings to test data transfer instructions (for disassembly purposes)
+0xe3a00000; // 	mov	r0, #0
+0xe3a01004; //  mov r1, #4
+0xe5910000; //	ldr	r0, [r1]
+0xe6914005; //  ldr r4, [r1], r5
+0xe3a00004; // 	mov	r0, #4
+0xe5804000; //  str r4, [r0]

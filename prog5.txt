@@ -1,0 +1,52 @@
+// Instruction encodings to test all supported instructions (for disassembly purposes)
+// NOTE: this is not really suitable for simulated execution, just disassembly
+0xe3a00000; // 	mov	r0, #0
+0xe3a00b02; // 	mov	r0, #2048
+0xe1a010a0; // 	mov r1,r0, lsr#1
+0xe1a01100; // 	mov r1,r0, lsl#2
+0xe1a011c0; // 	mov r1,r0, asr#3
+0xe1a01260; // 	mov r1,r0, ror#4
+0xe1a01040; // 	mov r1,r0, asr#32
+0xe0832114; //	add	r2, r3, r4, lsl r1
+0xe0832064; // 	add	r2, r3, r4, rrx
+0xe0832004; //  add r2, r3, r4
+0xe0454006; //  sub r4, r5, r6
+0xe0a54007; //  adc r4, r5, r7
+0xe0c21003; //  sbc r1, r2, r3
+0xe0632004; //  rsb r2, r3, r4
+0xe0e65007; //  rsc r5, r6, r7
+0xe3e00005; //  mvn r0, #5
+0xe31100ff; //  tst r1, #255; 0xff
+0xe332000f; //  teq r2, #15
+0xe3c330c1; //  bic r3, r3, #193; 0xc1
+0xe1120003; //  tst r2, r3
+0xe15b000a; //  cmp r11, sl
+0xe37a0001; //  cmn r10, #1
+0xe382100f; //  orr r1, r2, #15
+0xe0032001; //  and r2, r3, r1
+0xe2254eab; //  eor r4, r5, #2736; 0xab0
+0xe5910000; //	ldr	r0, [r1]
+0xe595400a; // 	ldr	r4, [r5, #10]
+0xe5154001; // 	ldr	r4, [r5, #-1]
+0xe5B540cc; //  ldr r4, [r5, #204]!
+0xe7154006; //  ldr r4, [r5, -r6]
+0xe7b27081; //  ldr r7, [r2, r1, lsl #1]!
+0xe6154006; //  ldr r4, [r5], -r6
+0xe6914005; //  ldr r4, [r1], r5
+0xe61540e6; //  ldr r4, [r5], -r6, ror #1
+0xe69542c6; //  ldr r4, [r5], r6, asr #5
+0xe412400a; //  ldr r4, [r2], #-10
+0xe493400c; //  ldr r4, [r3], #12
+0xe3a00000; //  mov r0, #0
+0xe3a01000; //  mov r1, #0
+0xe7a04001; //  str r4, [r0, r1]!
+0xe6004061; //  str r4, [r0], -r1, rrx
+0xe5814004; //  str r4, [r1, #4]
+0xe5804000; //  str r4, [r0]
+0x25804000; //  str cs	r4, [r0]
+0x9f000100; //  swils	256
+0xef000001; //  swi 1
+0xea000002; // 	b 8
+0x1afffffc; //	bne -16
+0xebfffffb; //	bl -20
+0x0bfffffa; //	bleq -24
