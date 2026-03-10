@@ -33,9 +33,9 @@ You should see something like `Apple clang version 15...` — that’s fine; it 
 
 ---
 
-## Step 2 — Set up the project in Cursor
+## Step 2 — Set up the project in Code editor
 
-1. Open **Cursor**
+1. Open **Editor**
 2. **File → Open Folder** → open (or create) a folder named `arm_emulator`
 3. Put these in that folder:
    - `emulator.c` — main source
