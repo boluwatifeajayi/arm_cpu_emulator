@@ -1,630 +1,743 @@
-/*
- * emulator.c
- *
- * ARM CPU Emulator - Component 1: Instruction Decoder / Disassembler
- *
- * This program reads 32-bit ARM machine code instructions (either hardcoded
- * or loaded from a text file), decodes each instruction into its component
- * parts using bitwise operations, and displays the equivalent Assembly mnemonic.
- *
- * Covers: Data processing (ALU), Data transfer (LDR/STR), Branch (B/BL), SWI
- *
- * Usage:
- *   ./emulator              -- runs with hardcoded test instructions
- *   ./emulator prog1.txt    -- loads instructions from a file
- *
- * Author: [Your Name]
- * Date:   [Today's Date]
- * Module: Software and Systems Development CRN:11550
- */
-
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdint.h>
-#include <string.h>
-
-/* ===========================================================================
- * TYPE DEFINITIONS
- * Use platform-independent fixed-width types from <stdint.h> so the sizes
- * are guaranteed regardless of the platform this runs on.
- * =========================================================================== */
-
-typedef uint32_t REGISTER;  /* CPU registers are 32 bits wide */
-typedef uint32_t WORD;      /* A memory word is also 32 bits */
-typedef uint8_t  BYTE;      /* A byte is 8 bits */
-
-/* ===========================================================================
- * MACHINE STATE
- * These globals represent the internal state of the simulated CPU.
- * =========================================================================== */
-
-BYTE     sr          = 0;         /* 8-bit Status Register (N Z C V I F S1 S0) */
-REGISTER registers[16];           /* 16 general-purpose registers R0-R15 */
-WORD     memory[1024];            /* Virtual RAM: 1024 words = 4KB */
-
-/* ===========================================================================
- * CONDITION CODE CONSTANTS
- * Bits [31:28] of every ARM instruction hold a condition code.
- * The CPU checks the status register flags against this code before executing.
- * =========================================================================== */
-
-#define COND_CODE_POS  28    /* Bit position of the condition code field */
-
-#define CC_EQ  0x0   /* Equal:            Z set */
-#define CC_NE  0x1   /* Not Equal:        Z clear */
-#define CC_CS  0x2   /* Carry Set:        C set */
-#define CC_CC  0x3   /* Carry Clear:      C clear */
-#define CC_MI  0x4   /* Minus/Negative:   N set */
-#define CC_PL  0x5   /* Plus/Positive:    N clear */
-#define CC_VS  0x6   /* Overflow Set:     V set */
-#define CC_VC  0x7   /* Overflow Clear:   V clear */
-#define CC_HI  0x8   /* Higher:           C set AND Z clear */
-#define CC_LS  0x9   /* Lower or Same:    C clear OR Z set */
-#define CC_GE  0xa   /* Greater or Equal: N==V */
-#define CC_LT  0xb   /* Less Than:        N!=V */
-#define CC_GT  0xc   /* Greater Than:     Z clear AND N==V */
-#define CC_LE  0xd   /* Less or Equal:    Z set OR N!=V */
-#define CC_AL  0xe   /* Always:           (unconditional) */
-#define CC_NV  0xf   /* Never:            never executes */
-
-/* Human-readable labels for each condition code, indexed by value 0-15.
- * AL is shown as empty string (conventional to omit it in assembly output). */
-char *condition_labels[] = {
-    "EQ", "NE", "CS", "CC", "MI", "PL", "VS", "VC",
-    "HI", "LS", "GE", "LT", "GT", "LE", "",   "NV"
-};
-
-/* ===========================================================================
- * STATUS REGISTER FLAG CONSTANTS
- * The 8-bit SR has flags in bits 7-4. We use bitmasks to test/set them.
- * =========================================================================== */
-
-#define STAT_N  (1<<7)  /* Negative flag: set if result was negative */
-#define STAT_Z  (1<<6)  /* Zero flag:     set if result was zero */
-#define STAT_C  (1<<5)  /* Carry flag:    set if operation produced a carry */
-#define STAT_V  (1<<4)  /* Overflow flag: set if signed overflow occurred */
-
-/* ===========================================================================
- * DATA PROCESSING (ALU) INSTRUCTION CONSTANTS
- * Layout: | Cond[31:28] | 00 | I[25] | OpCode[24:21] | S[20] | Rn[19:16] | Rd[15:12] | Op2[11:0] |
- * =========================================================================== */
-
-#define ALU_OP_CODE_POS   21        /* Bit position of the ALU opcode field */
-#define ALU_OP_CODE_MASK  0xf       /* 4-bit mask to extract the opcode */
-#define ALU_REG_N_POS     16        /* Bit position of the Rn (first operand) register field */
-#define ALU_REG_N_MASK    0xf       /* 4-bit mask */
-#define ALU_REG_DEST_POS  12        /* Bit position of the Rd (destination) register field */
-#define ALU_REG_DEST_MASK 0xf       /* 4-bit mask */
-
-#define ALU_S_BIT (1<<20)  /* Set Status bit: if set, instruction updates the SR flags */
-#define ALU_I_BIT (1<<25)  /* Immediate bit:  if set, Operand2 is an immediate value */
-
-/* ALU opcodes (bits 24:21) — identify which data-processing instruction to perform */
-#define AND  0   /* Rd = Rn & Op2 */
-#define EOR  1   /* Rd = Rn ^ Op2 */
-#define SUB  2   /* Rd = Rn - Op2 */
-#define RSB  3   /* Rd = Op2 - Rn */
-#define ADD  4   /* Rd = Rn + Op2 */
-#define ADC  5   /* Rd = Rn + Op2 + Carry */
-#define SBC  6   /* Rd = Rn - Op2 - !Carry */
-#define RSC  7   /* Rd = Op2 - Rn - !Carry */
-#define TST  8   /* flags from Rn & Op2  (no result stored) */
-#define TEQ  9   /* flags from Rn ^ Op2  (no result stored) */
-#define CMP  10  /* flags from Rn - Op2  (no result stored) */
-#define CMN  11  /* flags from Rn + Op2  (no result stored) */
-#define ORR  12  /* Rd = Rn | Op2 */
-#define MOV  13  /* Rd = Op2 (Rn ignored) */
-#define BIC  14  /* Rd = Rn & ~Op2 */
-#define MVN  15  /* Rd = ~Op2 (Rn ignored) */
-
-/* Display labels for ALU opcodes, indexed 0-15 */
-char *alu_op_labels[] = {
-    "AND", "EOR", "SUB", "RSB", "ADD", "ADC", "SBC", "RSC",
-    "TST", "TEQ", "CMP", "CMN", "ORR", "MOV", "BIC", "MVN"
-};
-
-/* ===========================================================================
- * OPERAND 2 CONSTANTS
- * Op2 occupies bits [11:0] and its meaning depends on the I (immediate) bit.
- *
- * When I=1 (immediate):
- *   bits[11:8] = rotate amount (×2), bits[7:0] = 8-bit immediate value
- *
- * When I=0 (register):
- *   bits[3:0]  = register number
- *   bits[6:5]  = shift type (LSL/LSR/ASR/ROR)
- *   bits[11:7] = shift amount (or register if bit4=1)
- * =========================================================================== */
-
-#define OP2_I_VALUE_MASK      0xff   /* 8-bit immediate value mask */
-#define OP2_I_SHIFT_POS       8      /* Position of rotate amount in immediate form */
-#define OP2_I_SHIFT_MASK      0xf    /* 4-bit rotate amount mask */
-
-#define OP2_REG_VALUE_MASK    0xf    /* Mask to extract the register number */
-#define OP2_SHIFT_AMOUNT_POS  7      /* Position of the shift amount */
-#define OP2_SHIFT_AMOUNT_MASK 0x1f   /* 5-bit shift amount mask */
-#define OP2_SHIFT_TYPE_POS    5      /* Position of shift type bits */
-#define OP2_SHIFT_TYPE_MASK   0x3    /* 2-bit shift type mask */
-#define OP2_REG_SHIFT_POS     8      /* Position of register-controlled shift register number */
-#define OP2_REG_SHIFT_MASK    0xf    /* Mask for register-controlled shift */
-
-/* Shift type values */
-#define SHIFT_LSL  0x0   /* Logical Shift Left */
-#define SHIFT_LSR  0x1   /* Logical Shift Right */
-#define SHIFT_ASR  0x2   /* Arithmetic Shift Right */
-#define SHIFT_ROR  0x3   /* Rotate Right */
-#define SHIFT_RRX  0x4   /* Rotate Right with Extend (special case: shift amount = 0, type = ROR) */
-
-char *shift_labels[] = { "LSL", "LSR", "ASR", "ROR", "RRX" };
-
-/* ===========================================================================
- * DATA TRANSFER (LDR / STR) CONSTANTS
- * Layout: | Cond[31:28] | 01 | I[25] | P[24] | U[23] | B[22] | W[21] | L[20] | Rn[19:16] | Rd[15:12] | Offset[11:0] |
- * =========================================================================== */
-
-#define DT_OFFSET_MASK  0xfff    /* 12-bit offset mask */
-#define DT_L_BIT (1<<20)         /* Load/Store: 1=LDR (load), 0=STR (store) */
-#define DT_W_BIT (1<<21)         /* Write-back: 1=write updated address back to Rn */
-#define DT_B_BIT (1<<22)         /* Byte/Word:  1=byte transfer, 0=word transfer */
-#define DT_U_BIT (1<<23)         /* Up/Down:    1=add offset, 0=subtract offset */
-#define DT_P_BIT (1<<24)         /* Pre/Post:   1=pre-index (offset before), 0=post-index */
-#define DT_I_BIT (1<<25)         /* Immediate:  1=offset is a shifted register, 0=immediate */
-
-/* ===========================================================================
- * BRANCH INSTRUCTION CONSTANTS
- * Layout: | Cond[31:28] | 101 | L[24] | Offset[23:0] |
- * =========================================================================== */
-
-#define BRANCH_OFFSET_MASK  0xffffff   /* 24-bit signed offset mask */
-#define BRANCH_NEG_MASK     0xff000000 /* Used to sign-extend a negative offset */
-#define BRANCH_N_BIT        (1<<23)    /* If set, offset is negative */
-#define BRANCH_L_BIT        (1<<24)    /* Link bit: 1=BL (save return addr to R14), 0=B */
-
-/* ===========================================================================
- * SWI (SOFTWARE INTERRUPT) CONSTANTS
- * Layout: | Cond[31:28] | 1111 | SWI_code[23:0] |
- * =========================================================================== */
-
-#define SWI_CODE_MASK     0xffffff  /* 24-bit interrupt code mask */
-
-/* ===========================================================================
- * INSTRUCTION TYPE DETECTION BIT MASKS
- * Bits 27, 26, 25 identify the broad category of instruction.
- * =========================================================================== */
-
-#define BIT_4  (1<<4)
-#define BIT_20 (1<<20)
-#define BIT_24 (1<<24)
-#define BIT_25 (1<<25)
-#define BIT_26 (1<<26)
-#define BIT_27 (1<<27)
-#define BIT_31 (1<<31)
-
-/* ===========================================================================
- * STATUS REGISTER HELPER FUNCTIONS
- * =========================================================================== */
-
-/* Returns 1 if at least one of the given flag bits is set in the SR */
-int isSet(int flag)   { return (sr & flag) ? 1 : 0; }
-
-/* Returns 1 if all of the given flag bits are clear in the SR */
-int isClear(int flag) { return (sr & flag) ? 0 : 1; }
-
-/* Sets specified flag bit(s) in the SR */
-void setFlag(int flag)  { sr = sr | flag; }
-
-/* Clears specified flag bit(s) in the SR */
-void clearFlag(int flag) { sr = sr & (~flag); }
-
-/* Sets or clears a flag depending on the 'set' parameter (non-zero = set) */
-void updateFlag(int flag, int set) {
-    if (set) sr = sr | flag;
-    else     sr = sr & (~flag);
-}
-
-/* ===========================================================================
- * REGISTER NAME HELPER
- * ARM has conventional names for some registers (sp, lr, pc).
- * Returns the conventional name string for registers 13, 14, 15,
- * or "rN" for registers 0-12. Also handles "sl" (r10) and "fp" (r11).
- * =========================================================================== */
-const char* regName(int r) {
-    /* Static array of register name strings */
-    static const char *names[] = {
-        "r0","r1","r2","r3","r4","r5","r6","r7",
-        "r8","r9","sl","fp","ip","sp","lr","pc"
-    };
-    if (r >= 0 && r < 16) return names[r];
-    return "??";
-}
-
-/* ===========================================================================
- * OPERAND 2 DECODER
- * Decodes Operand 2 and writes a human-readable string into 'buf'.
- *
- * Two forms:
- *   Immediate (I=1): rotate a small 8-bit value left by (rotate*2) bits
- *   Register  (I=0): a register optionally shifted by an amount or another register
- * =========================================================================== */
-void decodeOperand2(WORD inst, int isBit, char *buf) {
-
-    if (isBit) {
-        /* --- IMMEDIATE FORM ---
-         * bits[7:0]  = 8-bit immediate value
-         * bits[11:8] = rotate amount (rotated RIGHT by rotate*2 positions) */
-        int imm    = inst & OP2_I_VALUE_MASK;
-        int rotate = (inst >> OP2_I_SHIFT_POS) & OP2_I_SHIFT_MASK;
-
-        /* Apply the rotate: rotate RIGHT by rotate*2 bits (circular) */
-        int shift_amount = rotate * 2;
-        uint32_t value;
-        if (shift_amount == 0) {
-            value = imm;
-        } else {
-            /* ROR: bits shifted off the right wrap to the top */
-            value = (imm >> shift_amount) | (imm << (32 - shift_amount));
-        }
-        sprintf(buf, "#%d", value);
-
-    } else {
-        /* --- REGISTER FORM ---
-         * bits[3:0]  = source register number
-         * bits[6:5]  = shift type
-         * bit[4]     = 0 means shift by immediate amount, 1 means shift by register */
-        int regNum    = inst & OP2_REG_VALUE_MASK;
-        int shiftType = (inst >> OP2_SHIFT_TYPE_POS) & OP2_SHIFT_TYPE_MASK;
-
-        if (inst & BIT_4) {
-            /* Shift amount is stored in another register (bits[11:8]) */
-            int shiftReg = (inst >> OP2_REG_SHIFT_POS) & OP2_REG_SHIFT_MASK;
-            sprintf(buf, "%s, %s %s", regName(regNum), shift_labels[shiftType], regName(shiftReg));
-        } else {
-            /* Shift amount is an immediate 5-bit value in bits[11:7] */
-            int shiftAmt = (inst >> OP2_SHIFT_AMOUNT_POS) & OP2_SHIFT_AMOUNT_MASK;
-
-            if (shiftAmt == 0 && shiftType == SHIFT_ROR) {
-                /* Special case: ROR with shift amount 0 means RRX (rotate right with extend) */
-                sprintf(buf, "%s, RRX", regName(regNum));
-            } else if (shiftAmt == 0) {
-                /* No shift: just output the register name alone */
-                sprintf(buf, "%s", regName(regNum));
-            } else {
-                sprintf(buf, "%s, %s #%d", regName(regNum), shift_labels[shiftType], shiftAmt);
-            }
-        }
-    }
-}
-
-/* ===========================================================================
- * DATA PROCESSING (ALU) INSTRUCTION DECODER
- * Extracts and prints the mnemonic for instructions in the format:
- *   MNEMONIC{cond} Rd, Rn, Op2    (most instructions)
- *   MNEMONIC{cond} Rd, Op2        (MOV, MVN — no Rn)
- *   MNEMONIC{cond} Rn, Op2        (TST, TEQ, CMP, CMN — no Rd, result not stored)
- * =========================================================================== */
-void decodeALU(WORD inst) {
-    /* Extract each field using bit shifts and masks */
-    int opcode  = (inst >> ALU_OP_CODE_POS)  & ALU_OP_CODE_MASK;
-    int regN    = (inst >> ALU_REG_N_POS)    & ALU_REG_N_MASK;
-    int regDest = (inst >> ALU_REG_DEST_POS) & ALU_REG_DEST_MASK;
-    int iBit    = (inst & ALU_I_BIT) ? 1 : 0;   /* 1 if Op2 is immediate */
-    int sBit    = (inst & ALU_S_BIT) ? 1 : 0;   /* 1 if instruction sets SR flags */
-    int condCode = inst >> COND_CODE_POS;
-
-    /* Decode the Operand 2 field into a readable string */
-    char op2str[64];
-    decodeOperand2(inst & 0xfff, iBit, op2str);
-
-    /* Build the condition suffix (e.g. "EQ", "NE", "" for AL) */
-    const char *cond = condition_labels[condCode];
-
-    /* Build the S suffix ("S" if the S bit is set, meaning flags get updated) */
-    const char *s = sBit ? "S" : "";
-
-    /* Print the mnemonic based on opcode type:
-     *
-     * MOV/MVN: only use Rd and Op2 (Rn is always 0000 in the encoding)
-     * TST/TEQ/CMP/CMN: only Rn and Op2 (Rd is 0000, no destination register)
-     * All others: use Rd, Rn, Op2
-     */
-    switch (opcode) {
-        case MOV:
-        case MVN:
-            /* No Rn for MOV/MVN */
-            printf("%s%s%s %s, %s",
-                alu_op_labels[opcode], cond, s,
-                regName(regDest), op2str);
-            break;
-
-        case TST:
-        case TEQ:
-        case CMP:
-        case CMN:
-            /* No Rd for comparison instructions — result only affects flags */
-            printf("%s%s %s, %s",
-                alu_op_labels[opcode], cond,
-                regName(regN), op2str);
-            break;
-
-        default:
-            /* Standard 3-operand form: Rd = Rn op Op2 */
-            printf("%s%s%s %s, %s, %s",
-                alu_op_labels[opcode], cond, s,
-                regName(regDest), regName(regN), op2str);
-            break;
-    }
-}
-
-/* ===========================================================================
- * DATA TRANSFER (LDR / STR) INSTRUCTION DECODER
- * Extracts and prints the mnemonic for single-register memory access.
- *
- * Addressing modes:
- *   [Rn]           — simple, no offset
- *   [Rn, #offset]  — pre-indexed immediate offset
- *   [Rn, Rm]       — pre-indexed register offset
- *   [Rn, #offset]! — pre-indexed with write-back
- *   [Rn], #offset  — post-indexed immediate
- *   [Rn], Rm       — post-indexed register
- * =========================================================================== */
-void decodeDT(WORD inst) {
-    int condCode = inst >> COND_CODE_POS;
-    int regN     = (inst >> ALU_REG_N_POS)    & ALU_REG_N_MASK;    /* Base register */
-    int regDest  = (inst >> ALU_REG_DEST_POS) & ALU_REG_DEST_MASK; /* Src/Dst register */
-
-    /* Extract control bits */
-    int lBit = (inst & DT_L_BIT) ? 1 : 0;  /* 1=LDR (load), 0=STR (store) */
-    int wBit = (inst & DT_W_BIT) ? 1 : 0;  /* 1=write updated address back to Rn */
-    int bBit = (inst & DT_B_BIT) ? 1 : 0;  /* 1=byte transfer */
-    int uBit = (inst & DT_U_BIT) ? 1 : 0;  /* 1=add offset, 0=subtract */
-    int pBit = (inst & DT_P_BIT) ? 1 : 0;  /* 1=pre-index, 0=post-index */
-    int iBit = (inst & DT_I_BIT) ? 1 : 0;  /* 1=offset is shifted register */
-
-    const char *cond = condition_labels[condCode];
-    const char *mnem = lBit ? "LDR" : "STR";
-    const char *bsuf = bBit ? "B"   : "";   /* "B" suffix for byte transfers */
-    const char *sign = uBit ? ""    : "-";  /* "-" prefix if subtracting offset */
-
-    /* Decode the offset/operand field (bits 11:0) */
-    char offsetStr[64];
-    if (iBit) {
-        /* Offset is a (possibly shifted) register — reuse Op2 decoder on bits[11:0] */
-        decodeOperand2(inst & 0xfff, 0, offsetStr);
-    } else {
-        /* Offset is a 12-bit immediate value */
-        int offset = inst & DT_OFFSET_MASK;
-        if (offset == 0)
-            offsetStr[0] = '\0';   /* No offset to show */
-        else
-            sprintf(offsetStr, "#%s%d", sign, offset);
-    }
-
-    /* Print the full mnemonic with addressing mode */
-    if (pBit) {
-        /* Pre-indexed: address calculated before transfer */
-        if (strlen(offsetStr) == 0) {
-            /* No offset: [Rn] */
-            printf("%s%s%s %s, [%s]",
-                mnem, cond, bsuf, regName(regDest), regName(regN));
-        } else if (wBit) {
-            /* Pre-indexed with write-back: [Rn, offset]! */
-            printf("%s%s%s %s, [%s, %s]!",
-                mnem, cond, bsuf, regName(regDest), regName(regN),
-                iBit ? offsetStr : offsetStr);
-        } else {
-            /* Pre-indexed no write-back: [Rn, offset] */
-            printf("%s%s%s %s, [%s, %s]",
-                mnem, cond, bsuf, regName(regDest), regName(regN), offsetStr);
-        }
-    } else {
-        /* Post-indexed: transfer happens first, then address updated */
-        if (strlen(offsetStr) == 0) {
-            printf("%s%s%s %s, [%s]",
-                mnem, cond, bsuf, regName(regDest), regName(regN));
-        } else {
-            printf("%s%s%s %s, [%s], %s",
-                mnem, cond, bsuf, regName(regDest), regName(regN), offsetStr);
-        }
-    }
-}
-
-/* ===========================================================================
- * BRANCH (B / BL) INSTRUCTION DECODER
- * Layout: | Cond[31:28] | 101 | L[24] | Offset[23:0] |
- *
- * The 24-bit offset is a signed two's complement value in WORDS.
- * Actual byte offset = (offset << 2) + 8 (ARM pipeline prefetch adds 8).
- * =========================================================================== */
-void decodeBranch(WORD inst) {
-    int condCode = inst >> COND_CODE_POS;
-    int lBit     = (inst & BRANCH_L_BIT) ? 1 : 0;  /* 1=BL (branch with link) */
-
-    /* Extract the 24-bit offset and sign-extend it to 32 bits */
-    int offset = inst & BRANCH_OFFSET_MASK;
-    if (inst & BRANCH_N_BIT) {
-        /* Bit 23 set means negative — fill upper 8 bits with 1s to sign extend */
-        offset |= BRANCH_NEG_MASK;
-    }
-
-    /* Convert word offset to byte offset, accounting for ARM pipeline (+8) */
-    int byteOffset = (offset << 2) + 8;
-
-    const char *cond = condition_labels[condCode];
-    const char *mnem = lBit ? "BL" : "B";
-
-    printf("%s%s %d", mnem, cond, byteOffset);
-}
-
-/* ===========================================================================
- * SWI (SOFTWARE INTERRUPT) INSTRUCTION DECODER
- * Layout: | Cond[31:28] | 1111 | Code[23:0] |
- * =========================================================================== */
-void decodeSWI(WORD inst) {
-    int condCode  = inst >> COND_CODE_POS;
-    int swiCode   = inst & SWI_CODE_MASK;  /* 24-bit interrupt code */
-    const char *cond = condition_labels[condCode];
-    printf("SWI%s %d", cond, swiCode);
-}
-
-/* ===========================================================================
- * MAIN DECODE DISPATCHER
- * Called once per instruction. Uses bits [27:26] (and sometimes [25] and [4])
- * to determine the broad instruction category, then dispatches to the
- * appropriate decoder function.
- *
- * Category detection (bits 27:26):
- *   00 = Data processing (ALU)
- *   01 = Data transfer (LDR/STR)
- *   10 = Branch (B/BL)
- *   11 = SWI
- * =========================================================================== */
-void decodeInstruction(WORD inst, WORD address) {
-
-    /* Print the address and raw op-code hex before the mnemonic */
-    printf("%08X : %08X   ", address, inst);
-
-    /* Extract bits 27 and 26 to determine instruction category */
-    int bit27 = (inst & BIT_27) ? 1 : 0;
-    int bit26 = (inst & BIT_26) ? 1 : 0;
-
-    if (!bit27 && !bit26) {
-        /* -------------------------------------------------------
-         * Bits 27:26 = 00 → Data Processing (ALU) instruction
-         * But we must distinguish from multiply instructions (bit4=1, bit7=1)
-         * For this assignment we only need to handle standard ALU instructions.
-         * ------------------------------------------------------- */
-        decodeALU(inst);
-
-    } else if (!bit27 && bit26) {
-        /* -------------------------------------------------------
-         * Bits 27:26 = 01 → Single Data Transfer (LDR / STR)
-         * ------------------------------------------------------- */
-        decodeDT(inst);
-
-    } else if (bit27 && !bit26) {
-        /* -------------------------------------------------------
-         * Bits 27:26 = 10 → Branch (B or BL)
-         * Confirm bit 25 is also set (101 = branch encoding)
-         * ------------------------------------------------------- */
-        if (inst & BIT_25) {
-            decodeBranch(inst);
-        } else {
-            printf("[Unknown instruction: %08X]", inst);
-        }
-
-    } else {
-        /* -------------------------------------------------------
-         * Bits 27:26 = 11 → SWI (Software Interrupt)
-         * The full encoding for SWI is bits 27:24 = 1111
-         * ------------------------------------------------------- */
-        decodeSWI(inst);
-    }
-
-    printf("\n");
-}
-
-/* ===========================================================================
- * FILE LOADER
- * Reads ARM instructions from a text file.
- * Each line should contain a hex number (with or without "0x" prefix),
- * optionally followed by a comment. Example:
- *
- *   0xe3a00001  // MOV r0, #1
- *   0xe3a01002  // MOV r1, #2
- *
- * Valid instructions are stored in the global memory[] array starting at index 0.
- * Returns the number of instructions loaded, or 0 on error.
- * =========================================================================== */
-int parseFile(char *path) {
-    FILE *fp = fopen(path, "r");
-
-    if (fp != NULL) {
-        const unsigned MAX_LENGTH = 256;
-        char buffer[MAX_LENGTH];
-        size_t n = 0;
-
-        printf("Loading file: %s\n\n", path);
-
-        while (fgets(buffer, MAX_LENGTH, fp)) {
-            char *end_ptr;
-
-            /* strtol with base 16 parses both "0xe3a00001" and "e3a00001" */
-            long num = strtol(buffer, &end_ptr, 16);
-
-            /* Only store values that fit in a 32-bit unsigned word */
-            if (num > 0 && num <= UINT32_MAX) {
-                memory[n++] = (WORD)num;
-            } else if (num != 0) {
-                fprintf(stderr, "Ignoring out-of-range value: %lX\n", num);
-            }
-        }
-
-        /* Terminate the instruction list with a zero word */
-        memory[n++] = 0;
-
-        fclose(fp);
-
-        printf("%zu instruction(s) loaded.\n\n", n - 1);
-        return (int)n;
-    }
-
-    perror("Could not open file");
+//imports, give access to certain functions and types,
+#include <stdint.h> 
+#include <stdio.h> 
+#include <stdlib.h> 
+#include <string.h> 
+
+// basic type definitions, this for code readability, 
+typedef uint32_t INSTRUCTION; // 32 bit instruction type, this is what we read from memory and decode to figure out what to do
+typedef uint32_t REGISTER; // 32 bit register type, this is what we use for our 16 registers,
+typedef uint8_t BYTE; // 8 bit byte type, used for byte mode in memory transfers
+
+
+#define NUMBER_OF_REGISTERS 16 // number of registers we have in our arm cpu
+#define MEMORY_SIZE 1024 // our memory size for our cpu, basically 4KB of memory
+#define STACK_START_ADDRESS 0x00010000 // keep track of start address of stack in the register
+
+
+REGISTER register_array[NUMBER_OF_REGISTERS]; // simulate a register storage for our array for our 16 registers,
+INSTRUCTION ram_memory_array[MEMORY_SIZE]; // simulate our ram memory, Instructions live here before being pulled into registers
+
+// status flags - N Z C V record what happened after each operation, used to know how to update flags after each instruction and also for conditional execution of instructions based on these flags
+int flag_NEGATIVE = 0;
+int flag_ZERO = 0;
+int flag_CARRY = 0;
+int flag_OVERFLOW = 0;
+
+
+#define PROGRAM_COUNTER register_array[15] //tracks where the program is and incremenrs by 4, r15 for arm
+#define STACK_POINTER register_array[13] // tracks the top of the stack address r13
+#define LINK_REGISTER register_array[14] // used to know where to return after an instruction r14
+
+
+unsigned long total_cycles = 0;  // just incrementer for anytime program runs an instruction
+
+// 16 possible condition codes that the cpu will underdstand names for numbers (0–15) that represent conditions., its to know if something should be run, used with our status flags
+#define COND_EQUAL 0x0       // EQ - Z set
+#define COND_NOT_EQUAL 0x1   // NE - Z clear
+#define COND_CARRY_SET 0x2   // CS - C set 
+#define COND_CARRY_CLEAR 0x3 // CC - C clear
+#define COND_MINUS 0x4       // MI - N set
+#define COND_PLUS 0x5        // PL - N clear
+#define COND_OVERFLOW 0x6    // VS - V set
+#define COND_NO_OVERFLOW 0x7 // VC - V clear
+#define COND_HI 0x8          // unsigned higher - C set and Z clear
+#define COND_LS 0x9          // unsigned lower or same - C clear or Z set
+#define COND_GE 0xA          // signed >= - N == V
+#define COND_LT 0xB          // signed < - N != V
+#define COND_GT 0xC          // signed > - Z clear and N == V
+#define COND_LE 0xD          // signed <= - Z set or N != V
+#define COND_ALWAYS 0xE      // AL - always run 
+#define COND_NEVER 0xF       // NV - never run 
+
+// function that uses CPU flags to decide whether an instruction should execute or be skipped.
+int check_cond(int cond) {
+  switch (cond) {
+  case COND_EQUAL:
+    return flag_ZERO == 1;
+  case COND_NOT_EQUAL:
+    return flag_ZERO == 0;
+  case COND_CARRY_SET:
+    return flag_CARRY == 1;
+  case COND_CARRY_CLEAR:
+    return flag_CARRY == 0;
+  case COND_MINUS:
+    return flag_NEGATIVE == 1;
+  case COND_PLUS:
+    return flag_NEGATIVE == 0;
+  case COND_OVERFLOW:
+    return flag_OVERFLOW == 1;
+  case COND_NO_OVERFLOW:
+    return flag_OVERFLOW == 0;
+  case COND_HI:
+    return (flag_CARRY == 1 && flag_ZERO == 0);
+  case COND_LS:
+    return (flag_CARRY == 0 || flag_ZERO == 1);
+  case COND_GE:
+    return (flag_NEGATIVE == flag_OVERFLOW);
+  case COND_LT:
+    return (flag_NEGATIVE != flag_OVERFLOW);
+  case COND_GT:
+    return (flag_ZERO == 0 && flag_NEGATIVE == flag_OVERFLOW);
+  case COND_LE:
+    return (flag_ZERO == 1 || flag_NEGATIVE != flag_OVERFLOW);
+  case COND_ALWAYS:
+    return 1;
+  case COND_NEVER:
     return 0;
+  default:
+    return 1;
+  }
 }
 
-/* ===========================================================================
- * MAIN ENTRY POINT
- * Sets up the virtual machine state, loads or hardcodes instructions,
- * then runs the fetch-decode loop printing each instruction.
- * =========================================================================== */
-int main(int argc, char *argv[]) {
+// helper mechanics to make our program behave like a cpu
 
-    /* --- Initialise all registers to 0 --- */
-    for (int i = 0; i < 16; i++)
-        registers[i] = 0;
 
-    /* R13 is conventionally the stack pointer — set to top of our virtual RAM.
-     * 1024 words × 4 bytes/word = 4096 bytes = 0x1000 */
-    registers[13] = 0x1000;
+// converts internal condition codes which are just numbers into the readable suffixes seen in ARM assembly.
+const char *cond_to_str(int cond) {
+  switch (cond) {
+  case COND_EQUAL:
+    return "eq";
+  case COND_NOT_EQUAL:
+    return "ne";
+  case COND_CARRY_SET:
+    return "cs";
+  case COND_CARRY_CLEAR:
+    return "cc";
+  case COND_MINUS:
+    return "mi";
+  case COND_PLUS:
+    return "pl";
+  case COND_OVERFLOW:
+    return "vs";
+  case COND_NO_OVERFLOW:
+    return "vc";
+  case COND_HI:
+    return "hi";
+  case COND_LS:
+    return "ls";
+  case COND_GE:
+    return "ge";
+  case COND_LT:
+    return "lt";
+  case COND_GT:
+    return "gt";
+  case COND_LE:
+    return "le";
+  case COND_ALWAYS:
+    return "";
+  default:
+    return "";
+  }
+}
 
-    /* --- Load instructions into virtual memory --- */
-    if (argc > 1) {
-        /* A filename was provided as a command-line argument — load from file */
-        if (parseFile(argv[1]) == 0) {
-            fprintf(stderr, "Failed to load instructions from file.\n");
-            return EXIT_FAILURE;
-        }
+// update N and Z flags based on a result
+void update_nz(uint32_t result) {
+  flag_NEGATIVE = (result >> 31) & 1; // set as  negative if the top bit is set as 1
+  flag_ZERO = (result == 0) ? 1 : 0; // set as zero if result is zero, otherwise clear
+}
+
+// handles the flads after an addition operation, needs to check for carry and overflow which are different things, also updates N and Z
+void update_flags_add(uint32_t a, uint32_t b, uint32_t result) {
+  update_nz(result);
+  // carry if result wrapped around
+  flag_CARRY = (result < a) ? 1 : 0;
+  // overflow if signs are wrong
+  flag_OVERFLOW = (((a ^ result) & (b ^ result)) >> 31) & 1;
+}
+
+// handles the flags after a subtraction operation, carry in subtraction means no borrow so its set if a is greater or equal to b, overflow is if the signs are wrong, also updates N and Z
+void update_flags_sub(uint32_t a, uint32_t b, uint32_t result) {
+  update_nz(result);
+  flag_CARRY = (a >= b) ? 1 : 0;
+  flag_OVERFLOW = (((a ^ b) & (a ^ result)) >> 31) & 1;
+}
+
+ // Applies bit shifting to a value based on the shift type and amount, moves the bits around
+uint32_t do_shift(uint32_t val, int shift_type, int amount) {
+  if (amount == 0)
+    return val;
+
+  switch (shift_type) {
+  case 0: // LSL
+    return val << amount; // logical shift left
+  case 1: // LSR
+    return val >> amount; // logical shift right
+  case 2: // ASR - arithmetic shift right (sign extend)
+    return (uint32_t)((int32_t)val >> amount); // arithmetic shift right same as LSR but the left fills with whatever the top bit was. So negative numbers stay negative.
+  case 3: // ROR - rotate right
+    amount = amount & 31; 
+    if (amount == 0)
+      return val;
+    return (val >> amount) | (val << (32 - amount)); // rotate right  bits that fall off the right end come back in on the left. Nothing gets lost, it just rotates around.
+  default:
+    return val;
+  }
+}
+
+// get shift type name as string for printing assembly
+const char *shift_name(int type) {
+  switch (type) {
+  case 0:
+    return "lsl";
+  case 1:
+    return "lsr";
+  case 2:
+    return "asr";
+  case 3:
+    return "ror";
+  default:
+    return "???";
+  }
+}
+
+// Turns register numbers into names
+const char *reg_name(int r) {
+  static char bufs[4][8];
+  static int idx = 0;
+  char *buf = bufs[idx % 4];
+  idx++;
+  switch (r) {
+  case 10:
+    return "sl"; // stack limit
+  case 11:
+    return "fp"; // frame pointer
+  case 12:
+    return "ip"; // instruction pointer
+  case 13:
+    return "sp"; // stack pointer
+  case 14:
+    return "lr"; // link register
+  case 15:
+    return "pc"; // program counter
+  default:
+    sprintf(buf, "r%d", r); 
+    return buf; // for r0-r9 just return r0, r1, etc.
+  }
+}
+
+// Extract operand2 → compute its value → build printable string
+uint32_t decode_operand2(INSTRUCTION inst, int is_imm, char *out_str) {
+  if (is_imm) {
+    // immediate value - 8 bit value rotated right by 2 * rotate field
+    int rotate = (inst >> 8) & 0xF;
+    uint32_t imm = inst & 0xFF;
+    uint32_t val = do_shift(imm, 3, rotate * 2); // ROR
+    if (rotate != 0) {
+      val = (imm >> (rotate * 2)) | (imm << (32 - rotate * 2));
     } else {
-        /* No file provided — use hardcoded test instructions */
-        int n = 0;
-        memory[n++] = 0xE3A00001;  /* MOV r0, #1   */
-        memory[n++] = 0xE3A01002;  /* MOV r1, #2   */
-        memory[n++] = 0xE0802001;  /* ADD r2, r0, r1 */
-        memory[n++] = 0xE2822005;  /* ADD r2, r2, #5 */
-        memory[n++] = 0x0;         /* Sentinel: marks end of program */
+      val = imm;
     }
+    sprintf(out_str, "#%u", val);
+    return val;
+  } else {
+    // register operand
+    int rm = inst & 0xF;
+    int shift_type = (inst >> 5) & 0x3;
+    int reg_shift = (inst >> 4) & 1; // 1 = shift amount is in a register
 
-    /* --- Print header --- */
-    printf("%-12s %-12s  %s\n", "Address", "Op-Code", "Assembly Mnemonic");
-    printf("--------------------------------------------------\n");
+    if (reg_shift) {
+      // shift amount comes from a register
+      int rs = (inst >> 8) & 0xF;
+      int amount = register_array[rs] & 0xFF;
+      // special case: rrx
+      if (shift_type == 3 && amount == 0) {
+        uint32_t result = (register_array[rm] >> 1) | (flag_CARRY << 31);
+        sprintf(out_str, "%s, rrx", reg_name(rm));
+        return result;
+      }
+      uint32_t result = do_shift(register_array[rm], shift_type, amount);
+      sprintf(out_str, "%s, %s %s", reg_name(rm), shift_name(shift_type),
+              reg_name(rs));
+      return result;
+    } else {
+      int amount = (inst >> 7) & 0x1F;
+      // special case: RRX (ror with amount 0 is actually RRX)
+      if (shift_type == 3 && amount == 0) {
+        uint32_t result = (register_array[rm] >> 1) | (flag_CARRY << 31);
+        sprintf(out_str, "%s, rrx", reg_name(rm));
+        return result;
+      }
+      // lsl #0 is just the register itself
+      if (amount == 0 && shift_type == 0) {
+        sprintf(out_str, "%s", reg_name(rm));
+        return register_array[rm];
+      }
+      uint32_t result = do_shift(register_array[rm], shift_type, amount);
+      sprintf(out_str, "%s, %s #%d", reg_name(rm), shift_name(shift_type),
+              amount);
+      return result;
+    }
+  }
+}
 
-    /* --- Fetch-decode loop ---
-     * The PC (R15) starts at 0 and advances by 4 bytes per instruction.
-     * We divide the PC by 4 to get a word index into memory[]. */
-    int done = 0;
+// print all 16 registers, flags and cycle count to the terminal after each instruction
+void print_registers() {
+  printf("R0: %08X  R1: %08X  R2: %08X  R3: %08X\n", register_array[0],
+         register_array[1], register_array[2], register_array[3]);
+  printf("R4: %08X  R5: %08X  R6: %08X  R7: %08X\n", register_array[4],
+         register_array[5], register_array[6], register_array[7]);
+  printf("R8: %08X  R9: %08X  R10:%08X  R11:%08X\n", register_array[8],
+         register_array[9], register_array[10], register_array[11]);
+  printf("R12:%08X  R13:%08X  R14:%08X  R15:%08X\n", register_array[12],
+         register_array[13], register_array[14], register_array[15]);
+  printf("Flags: N=%d Z=%d C=%d V=%d\n", flag_NEGATIVE, flag_ZERO, flag_CARRY,
+         flag_OVERFLOW);
+  printf("Cycles so far: %lu\n", total_cycles);
+}
 
-    while (!done) {
-        WORD address = registers[15];       /* Current instruction address (byte address) */
-        WORD inst    = memory[address >> 2]; /* Fetch: divide by 4 to get word index */
-        registers[15] += 4;                  /* Advance PC to next instruction */
+// decode and execute one data processing instruction
+// Decode -> get operands -> Do operation -> update flags -> print disassembly maybe
+void do_data_processing(INSTRUCTION inst, int cond) {
 
-        if (inst != 0) {
-            decodeInstruction(inst, address);
+ //breaks down the instruction into its components
+  int is_imm = (inst >> 25) & 1; // I bit - determines if operand2 its 1 is immediate or register-based which is 0 (bits 25)
+  int opcode = (inst >> 21) & 0xF; // bits 24-21 give us the specific operation (ADD, SUB, AND, ORR, etc.)
+  int set_flags = (inst >> 20) & 1; // operate status flags or cpu flags if its 1 (bits 20)
+  int rn = (inst >> 16) & 0xF; // operand1 register number (bits 19-16) - this is the first operand for most instructions, but ignored for MOV/MVN
+  int rd = (inst >> 12) & 0xF; // destination register number (bits 15-12)  results
+
+    // gets pure operand2 value and also a string for disassembly
+  char op2_str[32];
+  uint32_t op2 = decode_operand2(inst, is_imm, op2_str); // operand2 is the shifted register or immediate value, and we also get a string for disassembly
+  uint32_t op1 = register_array[rn]; // operand1 is always the value in rn the first first source register number
+  uint32_t result = 0;
+
+  // figure out the operaton it is 
+  const char *mnem = "???"; // will hold the mnemonic for disassembly, default to ??? if we dont recognize it
+  int write_result = 1; // most instructions write back to rd, write result to register rd if this is 1, some instructions like TST/TEQ/CMP/CMN dont write to rd, they just update flags based on rn and op2, so for those we set this to 0
+
+  // look up code from encoding chart and do the operation, also update flags if needed, and build the disassembly string
+
+  switch (opcode) {
+  case 0x0: // AND
+    mnem = "and";
+    result = op1 & op2;
+    if (set_flags)
+    // AND updates N and Z based on the result, but doesnt affect C or V
+      update_nz(result);
+    break;
+  case 0x1: // EOR
+    mnem = "eor";
+    result = op1 ^ op2;
+    if (set_flags)
+      update_nz(result);
+    break;
+  case 0x2: // SUB
+    mnem = "sub";
+    result = op1 - op2;
+    if (set_flags)
+      update_flags_sub(op1, op2, result);
+    break;
+  case 0x3: // RSB - reverse subtract
+    mnem = "rsb";
+    result = op2 - op1;
+    if (set_flags)
+      update_flags_sub(op2, op1, result);
+    break;
+  case 0x4: // ADD
+    mnem = "add";
+    result = op1 + op2;
+    if (set_flags)
+      update_flags_add(op1, op2, result);
+    break;
+  case 0x5: // ADC - add with carry
+    mnem = "adc";
+    result = op1 + op2 + flag_CARRY;
+    if (set_flags)
+      update_flags_add(op1, op2, result);
+    break;
+  case 0x6: // SBC - subtract with carry
+    mnem = "sbc";
+    result = op1 - op2 - (1 - flag_CARRY);
+    if (set_flags)
+      update_flags_sub(op1, op2, result);
+    break;
+  case 0x7: // RSC
+    mnem = "rsc";
+    result = op2 - op1 - (1 - flag_CARRY);
+    if (set_flags)
+      update_flags_sub(op2, op1, result);
+    break;
+  case 0x8: // TST - test, just updates flags, no write
+    mnem = "tst";
+    result = op1 & op2;
+    write_result = 0;
+    if (set_flags)
+      update_nz(result);
+    break;
+  case 0x9: // TEQ - test equivalence
+    mnem = "teq";
+    result = op1 ^ op2;
+    write_result = 0;
+    if (set_flags)
+      update_nz(result);
+    break;
+  case 0xA: // CMP - compare
+    mnem = "cmp";
+    result = op1 - op2;
+    write_result = 0;
+    // CMP always updates flags even without S bit
+    update_flags_sub(op1, op2, result);
+    break;
+  case 0xB: // CMN - compare negative
+    mnem = "cmn";
+    result = op1 + op2;
+    write_result = 0;
+    update_flags_add(op1, op2, result);
+    break;
+  case 0xC: // ORR
+    mnem = "orr";
+    result = op1 | op2;
+    if (set_flags)
+      update_nz(result);
+    break;
+  case 0xD: // MOV - just moves op2 into rd
+    mnem = "mov";
+    result = op2;
+    if (set_flags)
+      update_nz(result);
+    break;
+  case 0xE: // BIC - bit clear
+    mnem = "bic";
+    result = op1 & ~op2;
+    if (set_flags)
+      update_nz(result);
+    break;
+  case 0xF: // MVN - move not
+    mnem = "mvn";
+    result = ~op2;
+    if (set_flags)
+      update_nz(result);
+    break;
+  }
+
+  // figure out what the S suffix should look like
+  const char *s_str = set_flags ? "s" : "";
+  const char *cond_str = cond_to_str(cond);
+
+  // print the disassembly line
+  // MOV and MVN dont use rn so just: mov rd, op2
+  if (opcode == 0xD || opcode == 0xF) {
+    printf("%s%s%s %s, %s", mnem, cond_str, s_str, reg_name(rd), op2_str);
+  }
+  // TST, TEQ, CMP, CMN dont write to rd - just: cmp rn, op2
+  else if (!write_result) {
+    printf("%s%s %s, %s", mnem, cond_str, reg_name(rn), op2_str);
+  }
+  // normal 3-operand: add rd, rn, op2
+  else {
+    printf("%s%s%s %s, %s, %s", mnem, cond_str, s_str, reg_name(rd),
+           reg_name(rn), op2_str);
+  }
+
+  // write result if needed and condition passes
+  if (write_result && check_cond(cond)) {
+    register_array[rd] = result;
+  }
+}
+
+// jumping to a different part of the program so It reads a branch instruction, figures out where to jump, and updates the program counter to go there.
+void do_branch(INSTRUCTION inst, int cond) {
+  int link = (inst >> 24) & 1; // is it branch with linkk which is function call, if set we need to save return address in link register because its a function
+  int32_t offset = inst & 0x00FFFFFF; // offset so it knows how far to jump
+  // sign extend from 24 bits
+
+  //handle negatuve jumps
+  if (offset & 0x800000) {
+    offset |= 0xFF000000;
+  }
+  offset = offset << 2;
+
+  const char *cond_str = cond_to_str(cond);
+
+  if (link) {
+    printf("bl%s #%d", cond_str, offset);
+  } else {
+    printf("b%s #%d", cond_str, offset);
+  }
+
+  if (check_cond(cond)) {
+    if (link) {
+      LINK_REGISTER = PROGRAM_COUNTER; // save return address
+    }
+    // PROGRAM_COUNTER is already pointing at next instruction (+4), add offset
+    // and +4 for pipeline
+    PROGRAM_COUNTER = PROGRAM_COUNTER + offset + 4;
+  }
+}
+
+// decode and handle LDR / STR (single data transfer)
+//“Figure out an address, then either read from it or write to it.”
+void do_mem_transfer(INSTRUCTION inst, int cond) {
+
+    // bits extraction
+  int is_reg_offset = (inst >> 25) & 1; // decode intruction flag so know if register or immidate number
+  int pre_index = (inst >> 24) & 1;     // to know qwhen to apply offset 
+  int up = (inst >> 23) & 1;            // add or subtract offset
+  int byte_mode = (inst >> 22) & 1;     // byte transfer if set the size of the transfer is 1 byte, otherwise its 4 bytes (a word)
+  int writeback = (inst >> 21) & 1;     // whether to update base register after transfer, 
+  int is_load = (inst >> 20) & 1;       // to know the operation, LDR or STR
+  int rn = (inst >> 16) & 0xF; // base address register
+  int rd = (inst >> 12) & 0xF; // data register
+
+
+
+  uint32_t offset = 0;
+  char offset_str[32] = "";
+
+  if (is_reg_offset) {
+    // register-based offset with optional shift
+    int rm = inst & 0xF;
+    int shift_type = (inst >> 5) & 0x3;
+    int amount = (inst >> 7) & 0x1F;
+
+    if (shift_type == 3 && amount == 0) {
+      // RRX
+      offset = (register_array[rm] >> 1) | (flag_CARRY << 31);
+      sprintf(offset_str, "%sr%d, rrx", up ? "" : "-", rm);
+    } else if (amount == 0) {
+      offset = register_array[rm];
+      sprintf(offset_str, "%s%s", up ? "" : "-", reg_name(rm));
+    } else {
+      offset = do_shift(register_array[rm], shift_type, amount);
+      sprintf(offset_str, "%s%s, %s #%d", up ? "" : "-", reg_name(rm),
+              shift_name(shift_type), amount);
+    }
+  } else {
+    // immediate offset
+    offset = inst & 0xFFF;
+    if (offset != 0)
+      sprintf(offset_str, "#%s%u", up ? "" : "-", offset);
+  }
+
+  // apply direction
+  uint32_t applied_offset = up ? offset : -offset;
+
+  // work out the actual address
+  uint32_t base = register_array[rn];
+  uint32_t addr = pre_index ? (base + applied_offset) : base;
+
+  // build the disassembly string
+  const char *cond_str = cond_to_str(cond);
+  const char *b_str = byte_mode ? "b" : "";
+  const char *op = is_load ? "ldr" : "str";
+
+  if (pre_index) {
+    if (strlen(offset_str) == 0)
+      printf("%s%s%s %s, [%s]", op, cond_str, b_str, reg_name(rd),
+             reg_name(rn));
+    else if (writeback)
+      printf("%s%s%s %s, [%s, %s]!", op, cond_str, b_str, reg_name(rd),
+             reg_name(rn), offset_str);
+    else
+      printf("%s%s%s %s, [%s, %s]", op, cond_str, b_str, reg_name(rd),
+             reg_name(rn), offset_str);
+  } else {
+    if (strlen(offset_str) == 0)
+      printf("%s%s%s %s, [%s]", op, cond_str, b_str, reg_name(rd),
+             reg_name(rn));
+    else
+      printf("%s%s%s %s, [%s], %s", op, cond_str, b_str, reg_name(rd),
+             reg_name(rn), offset_str);
+  }
+
+  if (check_cond(cond)) {
+    // convert memory INSTRUCTION address
+    uint32_t INSTRUCTION_addr = addr / 4;
+
+    if (INSTRUCTION_addr < MEMORY_SIZE) {
+      if (is_load) {
+        if (byte_mode)
+          register_array[rd] =
+              (ram_memory_array[INSTRUCTION_addr] >> ((addr % 4) * 8)) & 0xFF;
+        else
+          register_array[rd] = ram_memory_array[INSTRUCTION_addr];
+      } else {
+        if (byte_mode) {
+          // write just the byte - keep other bytes
+          int shift = (addr % 4) * 8;
+          ram_memory_array[INSTRUCTION_addr] =
+              (ram_memory_array[INSTRUCTION_addr] & ~(0xFF << shift)) |
+              ((register_array[rd] & 0xFF) << shift);
         } else {
-            printf("\n[End of program]\n");
-            done = 1;
+          ram_memory_array[INSTRUCTION_addr] = register_array[rd];
         }
+      }
     }
 
-    return EXIT_SUCCESS;
+    // writeback for post-index always happens, pre-index only if W bit set
+    if (!pre_index || writeback) {
+      register_array[rn] = base + applied_offset;
+    }
+  }
+}
+
+// handle software interrupt -just print it
+void do_swi(INSTRUCTION inst, int cond) {
+  uint32_t comment = inst & 0x00FFFFFF;
+  const char *cond_str = cond_to_str(cond);
+  printf("swi%s %u", cond_str, comment);
+  // in a real emulator this would call an OS handler but we just printing here
+
+}
+
+// main decode function its the engine which figures out what kind of
+// instruction it is and calls the right handler
+void decode_and_run(INSTRUCTION inst) {
+  // top 4 bits are the condition code
+  int cond = (inst >> 28) & 0xF; //slide right 28, then keep only the bottom 4 bits., this is for the condition code
+  int bits27_25 = (inst >> 25) & 0x7; //shift right 25, keep last 3 bits, this is for knowing the intruction type
+  int bit4 = (inst >> 4) & 0x1; //shift right 4, keep last 1 bit, determines if its a multiply instruction or not
+  int bit7 = (inst >> 7) & 0x1; // shift right 7, keep last 1 bit., also for multiply instruction
+
+  // print the opcode first
+  printf("  %08X    ", inst);
+
+  // figure out the instruction type using the standard ARM encoding chart
+  if (bits27_25 == 0b101) { //b101 means its branch intruction then do branch and they cost 3 cpu cycles 
+    // branch instruction
+    do_branch(inst, cond);
+    total_cycles += 3; // branches cost 3 cycles
+
+  } else if (bits27_25 == 0b111 && ((inst >> 24) & 1)) { // its a special intruction maybe used to exsit programs, 
+    // SWI
+    do_swi(inst, cond);
+    total_cycles += 3;
+  } else if (bits27_25 == 0b010 || bits27_25 == 0b011 || bits27_25 == 0b110 ||
+             bits27_25 == 0b111) { //memory type of intructions  so do meme transfer 
+    // data transfer (LDR/STR) with register or immediate offset
+    do_mem_transfer(inst, cond);
+    total_cycles += 3;
+  } else if (bits27_25 == 0b000 || bits27_25 == 0b001) { // ALU or multiply intructioins 
+    // data processing (ALU) or multiply - check bit 4 and 7 for multiply
+    int is_multiply =
+        (bits27_25 == 0 && bit7 == 1 && bit4 == 1 && ((inst >> 24) & 0xF) == 0);
+    if (is_multiply) { // detects multiply
+      // basic multiply - MUL
+      //  print it at least
+      int rd_m = (inst >> 16) & 0xF;
+      int rs = (inst >> 8) & 0xF;
+      int rm = inst & 0xF;
+      printf("mul %s, %s, %s", reg_name(rd_m), reg_name(rm), reg_name(rs));
+      if (check_cond(cond))
+        register_array[rd_m] = register_array[rm] * register_array[rs];
+      total_cycles += 2;
+    } else { // if not any of these then do the normal operations like add, sub, and, orr, eor, tst, teq, cmp, cmn, mov, mvn etc.
+      do_data_processing(inst, cond);
+      total_cycles += 1;
+    }
+  } else {
+    printf("??? (unrecognised instruction)");
+  }
+//a case of Take instruction → Look at key bits → Decide type → Run correct handler
+  printf("\n");
+}
+
+// load instructions from a text file into memory starting at index 0
+// the file format is one hex value per line like: 0xE3A00001
+// lines starting with // are comments and are ignored
+int load_from_file(const char *filename) {
+  FILE *f = fopen(filename, "r");
+  if (!f) {
+    printf("Could not open file: %s\n", filename);
+    return 0;
+  }
+
+  int count = 0;
+  char line[256];
+
+  while (fgets(line, sizeof(line), f)) {
+    // skip lines that start with // (full line comments)
+    char *trimmed = line;
+    while (*trimmed == ' ' || *trimmed == '\t')
+      trimmed++; // skip leading whitespace
+    if (trimmed[0] == '/' && trimmed[1] == '/')
+      continue;
+    if (trimmed[0] == '\n' || trimmed[0] == '\r' || trimmed[0] == '\0')
+      continue;
+
+    // strip trailing semicolon if present 
+    char *semi = strchr(line, ';');
+    if (semi)
+      *semi = ' '; // replace with space so sscanf stops there
+
+    // strip inline comments  anything after the hex value on same line
+    // we just read the first hex token and stop
+    unsigned int val = 0;
+    if (sscanf(trimmed, "0x%X", &val) == 1 ||
+        sscanf(trimmed, "%X", &val) == 1) {
+      if (count < MEMORY_SIZE) {
+        ram_memory_array[count++] = val;
+      }
+    }
+  }
+
+  fclose(f);
+  printf("Loaded %d instructions from %s\n\n", count, filename);
+  return count;
+}
+
+// reset everything back to zero per instructions
+void reset_state() {
+  int i;
+  for (i = 0; i < NUMBER_OF_REGISTERS; i++)
+    register_array[i] = 0;
+  STACK_POINTER = STACK_START_ADDRESS;
+  flag_NEGATIVE = flag_ZERO = flag_CARRY = flag_OVERFLOW = 0;
+  total_cycles = 0;
+  PROGRAM_COUNTER = 0;
+}
+
+// entry point - optionally takes a filename to load instructions from,
+// otherwise uses hardcoded test
+int main(int num_args, char *arg_values[]) {
+
+  // reset everything to a known state before starting
+  reset_state();
+
+  // if a filename is given, load instructions from there,
+  if (num_args > 1) {
+    int loaded = load_from_file(arg_values[1]);
+    if (loaded == 0) {
+      printf("No instructions loaded, exiting.\n");
+      return 1;
+    }
+    // put a zero at the end to terminate the loop
+    ram_memory_array[loaded] = 0;
+  } else {
+    // hardcoded test the basic example
+    printf("No file given so im using hardcoded test instructions\n\n");
+    ram_memory_array[0] = 0xE3A00001; // MOV r0,#1
+    ram_memory_array[1] = 0xE3A01002; // MOV r1,#2
+    ram_memory_array[2] = 0xE0802001; // ADD r2,r0,r1
+    ram_memory_array[3] = 0xE2822005; // ADD r2,r2,#5
+    ram_memory_array[4] = 0;          // end
+  }
+
+  printf("Op-Code       Assembly Mnemonic\n");
+  printf("-\n");
+
+  // main fetch-decode-execute loop
+  int done = 0;
+  while (!done) {
+    INSTRUCTION instruct = ram_memory_array[PROGRAM_COUNTER / 4]; 
+    PROGRAM_COUNTER += 4;   
+
+    if (instruct == 0) {
+      //end the program
+      done = 1;
+    } else {
+      decode_and_run(instruct);
+      print_registers();
+      printf("\nPress <enter> for next instruction to run");
+      getchar();
+      printf("\n");
+    }
+  }
+
+  printf("\nProgram end. Terminating.\n");
+  printf("Total cycles: %lu\n", total_cycles);
+
+  return 0;
 }
