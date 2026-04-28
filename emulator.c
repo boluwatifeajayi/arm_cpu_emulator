@@ -112,11 +112,11 @@ const char *cond_to_str(int cond) {
     return "vs";
   case COND_NO_OVERFLOW:
     return "vc";
-  case COND_HI:
+  case COND_HI: // unsigned higher, C set and Z clear
     return "hi";
   case COND_LS:
     return "ls";
-  case COND_GE:
+  case COND_GE: //greater or equal for signed numbers
     return "ge";
   case COND_LT:
     return "lt";
@@ -616,9 +616,9 @@ void decode_and_run(INSTRUCTION inst) {
     if (is_multiply) { // detects multiply
       // basic multiply - MUL
       //  print it at least
-      int rd_m = (inst >> 16) & 0xF;
-      int rs = (inst >> 8) & 0xF;
-      int rm = inst & 0xF;
+      int rd_m = (inst >> 16) & 0xF; //result
+      int rs = (inst >> 8) & 0xF; // source 1
+      int rm = inst & 0xF; // source 2
       printf("mul %s, %s, %s", reg_name(rd_m), reg_name(rm), reg_name(rs));
       if (check_cond(cond))
         register_array[rd_m] = register_array[rm] * register_array[rs];
@@ -628,7 +628,7 @@ void decode_and_run(INSTRUCTION inst) {
       total_cycles += 1;
     }
   } else {
-    printf("??? (unrecognised instruction)");
+    printf("??? unrecognised instruction");
   }
 //a case of Take instruction → Look at key bits → Decide type → Run correct handler
   printf("\n");
@@ -689,8 +689,7 @@ void reset_state() {
   PROGRAM_COUNTER = 0;
 }
 
-// entry point - optionally takes a filename to load instructions from,
-// otherwise uses hardcoded test
+// entry point 
 int main(int num_args, char *arg_values[]) {
 
   // reset everything to a known state before starting
@@ -721,7 +720,8 @@ int main(int num_args, char *arg_values[]) {
   // main fetch-decode-execute loop
   int done = 0;
   while (!done) {
-    INSTRUCTION instruct = ram_memory_array[PROGRAM_COUNTER / 4]; 
+    // fetch the next instruction
+    INSTRUCTION instruct = ram_memory_array[PROGRAM_COUNTER / 4];  //why divide by 4? because each instruction is 4 bytes, so to get the index in the array we divide the byte address by 4
     PROGRAM_COUNTER += 4;   
 
     if (instruct == 0) {
@@ -731,7 +731,7 @@ int main(int num_args, char *arg_values[]) {
       decode_and_run(instruct);
       print_registers();
       printf("\nPress <enter> for next instruction to run");
-      getchar();
+      getchar(); 
       printf("\n");
     }
   }
